@@ -17,7 +17,7 @@
 폴더 구조
 ---------
 project/
-├─ data/                  <- 분석할 엑셀 파일(.xlsx, .xls)을 여기에 넣는다
+├─ data/                  <- 분석할 엑셀 파일(.xlsx, .xls)을 여기에 넣는다.
 │   ├─ data_01.xlsx
 │   └─ ...
 ├─ risk_analysis.py
