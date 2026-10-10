@@ -62,6 +62,10 @@ COL_COUNT = "USE_CNT"    # 이용 횟수
 REQUIRED_COLS = [COL_DATE, COL_TIME, COL_REGION, COL_INDUSTRY,
                  COL_SEX, COL_AGE, COL_AMOUNT, COL_COUNT]
 
+SK_COL_YM = "STD_YM"         # 기준년월
+SK_COL_BLOCK = "BLOCK_CD"    # 블록 코드
+SK_FLOW_RE = re.compile(r"FLOW_POP_CNT", re.IGNORECASE)
+
 # ---- 분석 단위 -------------------------------------------------------
 # 이 데이터에는 개인 ID가 없는 '집계 데이터'이므로 개인이 아니라
 # "분석 단위(세그먼트)"별로 위험지수를 계산합니다.
@@ -177,68 +181,131 @@ def find_excel_files(folder):
                 found.append(p)
     return sorted(found)
 
-
 def load_all_excels(folder):
-    """모든 엑셀 파일/시트를 읽어 하나의 DataFrame으로 합친다. 실패한 파일은 건너뛴다."""
+    """모든 엑셀/CSV 파일을 읽어 신한(표준), 신한(고객기준), SK 데이터로 각각 분리·통합한다."""
     files = find_excel_files(folder)
     log, frames, sk_frames = [], [], []
+    
     code_dtype = {c: str for c in [COL_TIME, COL_REGION, COL_INDUSTRY, COL_SEX, COL_AGE,
-                                   "STD_YM", "BLOCK_CD"]}
+                                   "STD_YM", "BLOCK_CD", "CLN_SGG_CD"]}
+                                   
     for path in files:
         name = os.path.basename(path)
         try:
             if name.lower().endswith(".csv"):
-                # CSV 파일은 read_csv로 읽기 (인코딩 자동 시도)
                 try:
-                    raw = pd.read_csv(path, dtype=code_dtype, encoding="utf-8")
+                    raw = pd.read_csv(path, sep=r'[,|]', engine="python", dtype=code_dtype, encoding="utf-8-sig")
                 except UnicodeDecodeError:
-                    raw = pd.read_csv(path, dtype=code_dtype, encoding="cp949")
+                    raw = pd.read_csv(path, sep=r'[,|]', engine="python", dtype=code_dtype, encoding="cp949")
             else:
-                # 실제 엑셀 파일만 read_excel 사용
                 raw = pd.read_excel(path, sheet_name=SHEET_NAME, dtype=code_dtype)
-        except Exception as e:  # 파일 하나가 깨져도 계속 진행 # 파일 하나가 깨져도 계속 진행
+        except Exception as e:
             print(f"  [오류] {name}: 읽지 못함 -> {type(e).__name__}: {e}")
             log.append({"파일": name, "시트": "-", "상태": "읽기 실패", "행수": 0,
                         "비고": f"{type(e).__name__}: {e}"})
             continue
-        if isinstance(raw, pd.DataFrame):       # 시트 1개를 지정한 경우
+            
+        if isinstance(raw, pd.DataFrame):
             raw = {str(SHEET_NAME): raw}
+            
         for sheet, d in raw.items():
             d = d.copy()
             d.columns = [str(c).strip().upper() for c in d.columns]
-            # SK 유동인구 파일(컬럼 구조가 다름)인지 먼저 확인
-            flow_cols = [c for c in d.columns if SK_FLOW_RE.search(c)]
-            if (USE_SK_DATA and "STD_YM" in d.columns and flow_cols
-                    and not all(c in d.columns for c in REQUIRED_COLS)):
-                keep = ["STD_YM"] + (["BLOCK_CD"] if "BLOCK_CD" in d.columns else []) + flow_cols
-                sk = d[keep].copy()
-                if "BLOCK_CD" not in sk.columns:
-                    sk["BLOCK_CD"] = np.nan
-                sk["SOURCE_FILE"] = name
-                sk_frames.append(sk)
-                log.append({"파일": name, "시트": sheet, "상태": "사용(SK 유동인구)", "행수": len(d),
-                            "비고": f"유동인구 컬럼 {len(flow_cols)}개"})
-                print(f"  [읽음-SK] {name} / {sheet}: {len(d):,}행 (유동인구 컬럼 {len(flow_cols)}개)")
+            
+            # SK 유동인구 데이터 판별
+            is_sk = "STD_YM" in d.columns and any(k in c for c in d.columns for k in ["FLOW_POP_CNT", "TMST_"])
+            
+            if USE_SK_DATA and is_sk:
+                ym_col = next((c for c in d.columns if any(k in c for k in ["STD_YM", "YM", "DATE", "YMD"])), d.columns[0])
+                block_col = next((c for c in d.columns if "BLOCK" in c), None)
+                
+                id_vars = [ym_col]
+                if block_col:
+                    id_vars.append(block_col)
+                    
+                # 1) 시간대별 유동인구 (flow_time_pop: TMST_00 ~ TMST_23)
+                time_cols = [c for c in d.columns if c.startswith("TMST_")]
+                
+                # 2) 요일별 유동인구 (flow_wkdy_pop: _MON, _TUS 등)
+                wkdy_cols = [c for c in d.columns if any(w in c for w in ["_MON", "_TUS", "_WED", "_THU", "_FRI", "_SAT", "_SUN"])]
+                
+                # 3) 성별/연령대별 유동인구 (flow_age_pop: MAN_ / WMAN_ 등)
+                age_cols = [c for c in d.columns if "FLOW_POP_CNT" in c and not any(w in c for w in ["MON", "TUS", "WED", "THU", "FRI", "SAT", "SUN"])]
+                
+                if time_cols:
+                    melted = d.melt(id_vars=id_vars, value_vars=time_cols, var_name="POP_TYPE", value_name="USE_CNT")
+                    melted[COL_SEX] = "TOTAL"
+                    melted[COL_AGE] = "TOTAL"
+                    # TMST_08 -> 8 -> '8' 형태로 시간대 추출
+                    melted[COL_TIME] = melted["POP_TYPE"].str.replace("TMST_", "").astype(int).astype(str)
+                    
+                elif wkdy_cols:
+                    melted = d.melt(id_vars=id_vars, value_vars=wkdy_cols, var_name="POP_TYPE", value_name="USE_CNT")
+                    melted[COL_SEX] = "TOTAL"
+                    melted[COL_AGE] = "TOTAL"
+                    melted[COL_TIME] = "0"
+                    
+                elif age_cols:
+                    melted = d.melt(id_vars=id_vars, value_vars=age_cols, var_name="POP_TYPE", value_name="USE_CNT")
+                    melted[COL_SEX] = melted["POP_TYPE"].apply(lambda x: "M" if "MAN" in str(x) else "F")
+                    melted[COL_AGE] = melted["POP_TYPE"].str.extract(r"(\d+G[U]?)", expand=False)
+                    melted[COL_TIME] = "0"
+                else:
+                    continue
+
+                # 공통 표준 스키마 매핑
+                melted[COL_DATE] = melted[ym_col].astype(str).str.slice(0, 6) + "01"
+                melted[COL_REGION] = melted[block_col].astype(str) if block_col and block_col in melted.columns else "UNKNOWN"
+                melted[COL_INDUSTRY] = "TOTAL"
+                melted[COL_AMOUNT] = melted["USE_CNT"]
+                
+                sk_standard = melted[[COL_DATE, COL_TIME, COL_REGION, COL_INDUSTRY, COL_SEX, COL_AGE, COL_AMOUNT, COL_COUNT]].copy()
+                sk_standard["SOURCE_FILE"] = name
+                sk_frames.append(sk_standard)
+                print(f"  [읽음-SK] {name} / {sheet}: {len(sk_standard):,}행")
                 continue
-            miss = [c for c in REQUIRED_COLS if c not in d.columns]
-            if miss:
-                print(f"  [건너뜀] {name} / {sheet}: 필요한 컬럼 없음 {miss}")
-                log.append({"파일": name, "시트": sheet, "상태": "건너뜀(컬럼 부족)",
-                            "행수": len(d), "비고": f"없는 컬럼: {miss}"})
+                
+            # 신한 데이터 표준 (TIME_GB 존재, CLN_SGG_CD 없음)
+            if all(c in d.columns for c in REQUIRED_COLS):
+                d_std = d[REQUIRED_COLS].copy()
+                d_std["SOURCE_FILE"] = name
+                d_std["SOURCE_SHEET"] = str(sheet)
+                frames.append(d_std)
+                print(f"  [읽음-신한표준] {name} / {sheet}: {len(d_std):,}행")
                 continue
-            d = d[REQUIRED_COLS].copy()
-            d["SOURCE_FILE"] = name
-            d["SOURCE_SHEET"] = str(sheet)
-            frames.append(d)
-            log.append({"파일": name, "시트": sheet, "상태": "사용", "행수": len(d), "비고": ""})
-            print(f"  [읽음] {name} / {sheet}: {len(d):,}행")
+                
+            # 신한 데이터 고객거주지 (TIME_GB 없음, CLN_SGG_CD 존재)
+            if "CLN_SGG_CD" in d.columns:
+                d_cln = d.copy()
+                # 표준 컬럼 형태로 이름 매핑 및 부족한 컬럼 채우기
+                d_cln[COL_REGION] = d_cln["CLN_SGG_CD"]
+                if COL_TIME not in d_cln.columns:
+                    d_cln[COL_TIME] = "0"  # 시간대 정보가 없으면 기본값 부여
+                    
+                # 필수 컬럼들이 모두 갖춰졌는지 확인 후 추출
+                miss = [c for c in REQUIRED_COLS if c not in d_cln.columns]
+                if not miss:
+                    d_final = d_cln[REQUIRED_COLS].copy()
+                    d_final["SOURCE_FILE"] = name
+                    d_final["SOURCE_SHEET"] = str(sheet)
+                    frames.append(d_final)
+                    print(f"  [읽음-신한거주지] {name} / {sheet}: {len(d_final):,}행")
+                    continue
+                    
+            # 그 외 규격에 없는 형식
+            print(f"  [건너뜀] {name} / {sheet}: 호환되는 컬럼 구조 아님")
+            log.append({"파일": name, "시트": sheet, "상태": "건너뜀(구조 불일치)", "행수": len(d), "비고": "일치 하지 않는 규격"})
+            
     sk_df = pd.concat(sk_frames, ignore_index=True) if sk_frames else None
     if not frames:
         return None, log, files, sk_df
     return pd.concat(frames, ignore_index=True), log, files, sk_df
 
+<<<<<<< HEAD
 
 
+=======
+>>>>>>> lee
 # ---------------------------------------------------------------------
 # 2. 형식 정리 + 결측/이상치 점검
 # ---------------------------------------------------------------------
