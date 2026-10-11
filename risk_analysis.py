@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+## -*- coding: utf-8 -*-
 """
 신한카드 데이터 기반 '사회적 고립 위험 가능성' 1차 탐색 도구
 =====================================================================
@@ -17,7 +17,7 @@
 폴더 구조
 ---------
 project/
-├─ data/                  <- 분석할 엑셀 파일(.xlsx, .xls)을 여기에 넣는다.
+├─ data/                  <- 분석할 엑셀 파일(.xlsx, .xls)을 여기에 넣는다
 │   ├─ data_01.xlsx
 │   └─ ...
 ├─ risk_analysis.py
@@ -61,10 +61,6 @@ COL_AMOUNT = "TS_AT"     # 거래/매출 지표
 COL_COUNT = "USE_CNT"    # 이용 횟수
 REQUIRED_COLS = [COL_DATE, COL_TIME, COL_REGION, COL_INDUSTRY,
                  COL_SEX, COL_AGE, COL_AMOUNT, COL_COUNT]
-
-SK_COL_YM = "STD_YM"         # 기준년월
-SK_COL_BLOCK = "BLOCK_CD"    # 블록 코드
-SK_FLOW_RE = re.compile(r"FLOW_POP_CNT", re.IGNORECASE)
 
 # ---- 분석 단위 -------------------------------------------------------
 # 이 데이터에는 개인 ID가 없는 '집계 데이터'이므로 개인이 아니라
