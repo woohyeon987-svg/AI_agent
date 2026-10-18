@@ -86,7 +86,9 @@ BASELINE_MONTHS = 3           # '과거' 구간 개월 수(최근 직전부터).
 MIN_BASELINE_MONTHS = 2       # 과거 구간 최소 개월 수(미만이면 '변화 판단불가')
 MIN_DAYS_PER_MONTH = 7        # 데이터 일수가 이보다 적은 달은 분석에서 제외
 MIN_SEGMENT_TOTAL = 30        # 분석 단위의 전체 이용건수가 이보다 적으면 '표본부족'
-MIN_PEERS = 5                 # 연령대 안에 분석 단위가 이보다 적으면 전체 기준으로 대체
+MIN_PEERS = 2                # 연령대 내 유효 표본이 이보다 적으면 해당 연령대는 판단불가
+AUTO_RELAX_MIN_PEERS = True   # 어떤 연령대도 MIN_PEERS를 못 채우면, 가장 큰 연령대 표본 수로 자동 완화해 계속 진행
+MIN_PEERS_FLOOR = 5           # 자동 완화 시 이 값보다 작아지지는 않음(미만이면 중단)
 FILL_MISSING_MONTH_AS_ZERO = True  # 어떤 달에 기록이 없으면 0으로 간주할지
 
 # ---- 구조(다양성/편중) 계산 구간 -------------------------------------
@@ -118,6 +120,17 @@ SK_SEX_VALUES = {"MAN": ["M", "1", "남", "남성", "MALE"],
 SK_AGE_MAP = None
 # BLOCK_CD 앞 n자리를 지역으로 보고 MCT_SGG_CD와 맞추려면 자릿수 지정 (예: 5). None이면 전 지역 합산
 SK_REGION_PREFIX_LEN = None
+# 성별·연령대 컬럼이 없는 SK 파일(전체 유동인구만 있는 파일)도 함께 읽습니다.
+# - 컬럼명에 FLOW_POP_CNT 가 들어 있는 컬럼(없으면 TMST_ 로 시작하는 컬럼 합계)을 '전체 유동인구'로 사용
+# - 성별·연령대별 SK 값이 있는 분석 단위는 그 값을 쓰고, 없는 분석 단위는 '전체 유동인구' 변화로 대체
+SK_TOTAL_COL_RE = re.compile(r"FLOW_POP_CNT", re.IGNORECASE)
+SK_TOTAL_PREFERRED_RE = re.compile(r"^(TOT|TOTAL)?_?FLOW_POP_CNT$", re.IGNORECASE)
+SK_TMST_RE = re.compile(r"^TMST_", re.IGNORECASE)
+# SK 중복 행 처리 방식
+#  "exact": 모든 컬럼 값이 완전히 같은 행만 중복으로 보고 제거(일·시간 등 다른 구분 컬럼이 있어도 안전)
+#  "key"  : (월, 소지역)당 1행만 사용(기존 방식. 한 소지역이 월에 여러 행이면 값이 크게 줄어들 수 있음)
+SK_DEDUP_MODE = "exact"
+SK_SPIKE_RATIO = 1.5          # 월별 유동인구 합계가 중앙값의 이 배수 이상/이하(역수)이면 경고
 
 # ---- 위험군 분류 (안정지수가 '낮을수록' 위험) -----------------------
 CLASSIFY_MODE = "percentile"    # "percentile" | "zscore" | "fixed"
@@ -172,10 +185,23 @@ def _to_standard(d):
     return d.groupby(keys, dropna=False, as_index=False)[[COL_AMOUNT, COL_COUNT]].sum(min_count=1)
 
 
+def _pick_total_cols(cols):
+    """성별·연령대 구분이 없는 SK 파일에서 '전체 유동인구'로 쓸 컬럼을 고른다.
+    1순위: FLOW_POP_CNT 총합 컬럼 / 2순위: FLOW_POP_CNT 이름이 들어간 컬럼 / 3순위: TMST_ 시간대 컬럼"""
+    cand = [c for c in cols if c not in ("STD_YM", "BLOCK_CD") and not SK_FLOW_RE.match(c)]
+    flow = [c for c in cand if SK_TOTAL_COL_RE.search(c) and not SK_TMST_RE.match(c)]
+    pref = [c for c in flow if SK_TOTAL_PREFERRED_RE.match(c)]
+    if pref:
+        return pref[:1]
+    if flow:
+        return flow
+    return [c for c in cand if SK_TMST_RE.match(c)]
+
+
 def load_all_excels(folder):
     """모든 엑셀/CSV 파일을 읽어 신한카드 데이터와 SK 유동인구 데이터로 분리·통합한다."""
     files = find_excel_files(folder)
-    log, frames, sk_frames = [], [], []
+    log, frames, sk_frames, sk_total_frames = [], [], [], []
 
     code_dtype = {c: str for c in [COL_DATE, COL_REGION, COL_INDUSTRY, COL_SEX, COL_AGE,
                                    "STD_YM", "BLOCK_CD", "CLN_SGG_CD"]}
@@ -204,14 +230,40 @@ def load_all_excels(folder):
             d.columns = [str(c).strip().upper() for c in d.columns]
 
             # ---- SK 유동인구 데이터 ----
-            # 성별·연령대별 파일(flow_age_pop)만 원본 형태 그대로 사용하고, 시간대/요일 파일은 쓰지 않는다.
+            # (1) 성별·연령대 컬럼(MAN_/WMAN_FLOW_POP_CNT_xxG)이 있는 파일 -> 성별·연령대별로 사용
+            # (2) 성별·연령대 컬럼이 없는 파일 -> '전체 유동인구'로 읽어 보조 지표로 사용
             if "STD_YM" in d.columns and any("FLOW_POP_CNT" in c or c.startswith("TMST_") for c in d.columns):
                 flow_cols = [c for c in d.columns if SK_FLOW_RE.match(c)]
-                if USE_SK_DATA and flow_cols and "BLOCK_CD" in d.columns:
-                    sk_frames.append(d[["STD_YM", "BLOCK_CD"] + flow_cols].copy())
+                if not USE_SK_DATA:
+                    print(f"  [건너뜀-SK] {name} / {sheet}: SK 사용 안 함(USE_SK_DATA=False)")
+                    log.append({"파일": name, "시트": sheet, "상태": "건너뜀(SK 사용 안 함)", "행수": len(d), "비고": ""})
+                    continue
+                if flow_cols and "BLOCK_CD" in d.columns:
+                    extra = [c for c in d.columns if c not in ["STD_YM", "BLOCK_CD"] + flow_cols]
+                    sk_frames.append(d[["STD_YM", "BLOCK_CD"] + flow_cols + extra].copy())
                     print(f"  [읽음-SK] {name} / {sheet}: {len(d):,}행")
+                    log.append({"파일": name, "시트": sheet, "상태": "읽음(SK 성별·연령대별)", "행수": len(d),
+                                "비고": f"유동인구 컬럼 {len(flow_cols)}개"})
+                    continue
+                tot_cols = _pick_total_cols(d.columns)
+                if tot_cols:
+                    n_dup = int(d.duplicated().sum())
+                    if n_dup:
+                        d = d.drop_duplicates()
+                    t = pd.DataFrame({"STD_YM": d["STD_YM"]})
+                    t["BLOCK_CD"] = d["BLOCK_CD"] if "BLOCK_CD" in d.columns else pd.NA
+                    t["SK_TOTAL"] = d[tot_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1, min_count=1)
+                    t["SOURCE"] = name
+                    sk_total_frames.append(t)
+                    shown = ", ".join(tot_cols[:5]) + (" 외" if len(tot_cols) > 5 else "")
+                    dup_txt = f", 완전 동일 행 {n_dup:,}건 제거" if n_dup else ""
+                    print(f"  [읽음-SK전체] {name} / {sheet}: {len(d):,}행{dup_txt} (성별·연령대 없음 -> 전체 유동인구로 사용: {shown})")
+                    log.append({"파일": name, "시트": sheet, "상태": "읽음(SK 전체 유동인구)", "행수": len(d),
+                                "비고": f"성별·연령대 컬럼 없음. 사용 컬럼: {shown}"})
                 else:
-                    print(f"  [건너뜀-SK] {name} / {sheet}: 성별·연령대 컬럼 없음(또는 SK 사용 안 함)")
+                    print(f"  [건너뜀-SK] {name} / {sheet}: 유동인구 컬럼을 찾지 못함")
+                    log.append({"파일": name, "시트": sheet, "상태": "건너뜀(SK 컬럼 없음)", "행수": len(d),
+                                "비고": f"컬럼: {list(d.columns)[:10]}"})
                 continue
 
             # ---- 신한카드 데이터 ----
@@ -234,9 +286,10 @@ def load_all_excels(folder):
                         "비고": f"합산 후 {len(d_std):,}행"})
 
     sk_df = pd.concat(sk_frames, ignore_index=True) if sk_frames else None
+    sk_total_df = pd.concat(sk_total_frames, ignore_index=True) if sk_total_frames else None
     if not frames:
-        return None, log, files, sk_df
-    return pd.concat(frames, ignore_index=True), log, files, sk_df
+        return None, log, files, sk_df, sk_total_df
+    return pd.concat(frames, ignore_index=True), log, files, sk_df, sk_total_df
 
 
 # ---------------------------------------------------------------------
@@ -388,17 +441,18 @@ def build_monthly(df):
 # 4. 공통 도구: 연령대 내 백분위, 변화 지표
 # ---------------------------------------------------------------------
 def peer_percentile(values, peers, eligible):
-    """같은 연령대 안에서 0(최저)~1(최고) 백분위. 비교 대상이 적으면 전체 기준으로 대체."""
+    """연령대 내 0(최저)~1(최고) 백분위. 표본 부족 시 전체 기준으로 대체하지 않고 판단불가."""
     v = values.where(eligible)
-    n_all = v.notna().sum()
-    glob = (v.rank(method="average") - 1) / (n_all - 1) if n_all > 1 else v * np.nan
     cnt = v.groupby(peers).transform("count")
     rk = v.groupby(peers).rank(method="average")
     pct_g = (rk - 1) / (cnt - 1)
     use_g = (cnt >= MIN_PEERS) & v.notna()
-    pct = pct_g.where(use_g, glob)
-    scope = pd.Series(np.where(v.isna(), "-", np.where(use_g, "연령대 내", "전체 기준(표본부족)")),
-                      index=values.index)
+    pct = pct_g.where(use_g, np.nan)
+    scope = pd.Series(
+        np.where(v.isna(), "판단불가(값 없음)",
+                 np.where(use_g, "연령대 내", "판단불가(연령대 표본부족)")),
+        index=values.index
+    )
     return pct, scope
 #================================================================================================
 #최근 활동량 비교 // 과거에는 활동량이 어느 정도였고, 최근에는 얼마나 줄었으며, 그 감소가 몇 개월 동안 이어졌는지
@@ -481,6 +535,34 @@ def pattern_metrics(df, keys, months):
     return out, thr
 
 
+def spike_notes(label, month_totals):
+    """월별 합계가 중앙값보다 지나치게 크거나 작은 달을 찾아 경고 문구를 만든다."""
+    t = pd.Series(month_totals).astype(float)
+    med = t[t > 0].median()
+    out = []
+    if pd.notna(med) and med > 0:
+        for m, v in t.items():
+            if pd.notna(v) and (v >= med * SK_SPIKE_RATIO or v <= med / SK_SPIKE_RATIO):
+                out.append(f"[경고] {label} {m} 합계가 중앙값의 {v / med:.2f}배 -> 파일 중복/다른 기간 혼입 여부 확인")
+    return out
+
+
+def resolve_output_path(path):
+    """결과 파일이 엑셀/OneDrive 등에서 열려 있어 쓸 수 없으면 시각을 붙인 새 이름을 쓴다."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r+b"):
+                pass
+        except PermissionError:
+            from datetime import datetime
+            base, ext = os.path.splitext(path)
+            alt = f"{base}_{datetime.now():%Y%m%d_%H%M%S}{ext}"
+            print(f"    [주의] '{path}' 을(를) 쓸 수 없습니다(엑셀 등에서 열려 있을 수 있음). "
+                  f"-> '{alt}' 로 저장합니다.")
+            return alt
+    return path
+
+
 def build_sk(sk_raw, keys, months):
     """SK 유동인구를 월별/성별/연령대별로 정리하고, 각 분석 단위(keys)에 대응시킨다.
     반환: (SK 요약표, 분석단위별 월별 유동인구 행렬, 안내 문구 목록). 사용 불가면 (None, None, 안내)"""
@@ -493,10 +575,20 @@ def build_sk(sk_raw, keys, months):
         d[c] = pd.to_numeric(d[c], errors="coerce")
     if d["BLOCK_CD"].notna().any():             # 파일이 겹쳐 같은 (월, 소지역)이 두 번 나오면 한 번만
         d["BLOCK_CD"] = d["BLOCK_CD"].astype("string").str.strip()
-        nd = int(d.duplicated(["MONTH", "BLOCK_CD"]).sum())
-        if nd:
-            notes.append(f"SK 중복 행(월+소지역) {nd:,}건 제거")
-            d = d.drop_duplicates(["MONTH", "BLOCK_CD"])
+        n_key = int(d.duplicated(["MONTH", "BLOCK_CD"]).sum())
+        if SK_DEDUP_MODE == "key":
+            if n_key:
+                notes.append(f"SK 중복 행(월+소지역) {n_key:,}건 제거 (SK_DEDUP_MODE='key')")
+                d = d.drop_duplicates(["MONTH", "BLOCK_CD"])
+        else:
+            n_ex = int(d.duplicated().sum())
+            if n_ex:
+                notes.append(f"SK 완전 동일 행 {n_ex:,}건 제거")
+                d = d.drop_duplicates()
+            n_left = n_key - n_ex
+            if n_left > 0:
+                notes.append(f"SK: 같은 (월, 소지역)에 값이 다른 행 {n_left:,}건 있음 "
+                             "(일·시간 등 다른 구분 컬럼으로 추정) -> 모두 합산해 사용")
     if SK_REGION_PREFIX_LEN and d["BLOCK_CD"].notna().any():
         d["REGION_KEY"] = d["BLOCK_CD"].str[:SK_REGION_PREFIX_LEN]
     else:
@@ -512,6 +604,7 @@ def build_sk(sk_raw, keys, months):
     meta = piv[["REGION_KEY", "SK_SEX", "SK_AGE", "SK_OPEN"]]
     mat = piv.drop(columns=["REGION_KEY", "SK_SEX", "SK_AGE", "SK_OPEN"]).reindex(columns=months)
     overlap = int(mat.notna().any(axis=0).sum())
+    notes += spike_notes("SK 성별·연령대 유동인구", mat.sum(axis=0, min_count=1))
     sk_months = sorted(long["MONTH"].unique())
     notes.append(f"SK 유동인구 기간: {sk_months[0]} ~ {sk_months[-1]} / 카드 분석 월과 겹치는 달 {overlap}개")
     if overlap == 0:
@@ -562,6 +655,61 @@ def build_sk(sk_raw, keys, months):
     table["감소 지속 개월"] = cmeta["persist_months"].values
     return table, SKM, notes
 
+
+
+def build_sk_total(sk_total, keys, months):
+    """성별·연령대 구분이 없는 SK 유동인구(전체)를 월별로 정리하고 분석 단위(keys)에 대응시킨다.
+    반환: (요약표, 분석단위별 월별 유동인구 행렬, 안내 문구). 사용 불가면 (None, None, 안내)"""
+    notes = []
+    d = sk_total.copy()
+    d["MONTH"] = parse_dates(d["STD_YM"]).dt.to_period("M")
+    d = d.dropna(subset=["MONTH"])
+    d["VALUE"] = pd.to_numeric(d["SK_TOTAL"], errors="coerce")
+    d["BLOCK_CD"] = d["BLOCK_CD"].astype("string").str.strip()
+    has_block = bool(d["BLOCK_CD"].notna().any())
+    # 같은 (월, 소지역)이 여러 파일에 있으면(예: 시간대 파일 + 요일 파일) 한 파일 것만 사용 -> 이중 합산 방지
+    key = ["MONTH", "BLOCK_CD"] if has_block else ["MONTH"]
+    first = d.groupby(key, dropna=False)["SOURCE"].transform("min")
+    nd = int((d["SOURCE"] != first).sum())
+    if nd:
+        notes.append(f"SK 전체 유동인구: 여러 파일에 겹친 행 {nd:,}건 제외(이중 합산 방지)")
+        d = d[d["SOURCE"] == first]
+    per_key = d.groupby(key, dropna=False).size()
+    if len(per_key) and per_key.max() > 1:
+        notes.append(f"SK 전체 유동인구: 같은 (월, 소지역)에 최대 {int(per_key.max())}행(평균 {per_key.mean():.2f}행) -> 합산해 사용")
+    if SK_REGION_PREFIX_LEN and has_block:
+        d["REGION_KEY"] = d["BLOCK_CD"].str[:SK_REGION_PREFIX_LEN]
+    else:
+        d["REGION_KEY"] = "ALL"
+    notes += spike_notes("SK 전체 유동인구", d.groupby("MONTH")["VALUE"].sum(min_count=1))
+    g = (d.groupby(["REGION_KEY", "MONTH"])["VALUE"].sum(min_count=1)
+           .unstack("MONTH").reindex(columns=months))
+    sk_months = sorted(d["MONTH"].unique())
+    overlap = int(g.notna().any(axis=0).sum())
+    notes.append(f"SK 전체 유동인구(성별·연령대 없음) 기간: {sk_months[0]} ~ {sk_months[-1]} / "
+                 f"카드 분석 월과 겹치는 달 {overlap}개")
+    if overlap == 0:
+        notes.append("겹치는 달이 없어 SK 전체 유동인구는 사용하지 않음")
+        return None, None, notes
+    use_region = bool(SK_REGION_PREFIX_LEN) and has_block and COL_REGION in SEG
+    if use_region:
+        reg = keys[COL_REGION].astype(str).str[:SK_REGION_PREFIX_LEN]
+        miss = sorted(set(reg) - set(g.index))
+        if miss:
+            notes.append(f"SK 전체 유동인구와 지역이 매칭되지 않은 값({len(miss)}개): {', '.join(miss[:10])}")
+        arr = g.reindex(reg.values).values
+    else:
+        arr = np.tile(g.sum(axis=0, min_count=1).values, (len(keys), 1))
+    SKM = pd.DataFrame(arr, columns=months)
+    cmeta = change_metrics(g.reset_index(drop=True))
+    table = g.reset_index().rename(columns={"REGION_KEY": "지역키"})
+    table.columns = ["지역키"] + [f"유동인구_{m}" for m in months]
+    table["과거 평균 유동인구"] = cmeta["base"].values
+    table["최근 평균 유동인구"] = cmeta["recent"].values
+    table["유동인구 변화율(%)"] = cmeta["change_pct"].values * 100
+    table["감소 지속 개월"] = cmeta["persist_months"].values
+    notes.append("성별·연령대 구분이 없어 모든 분석 단위에 같은 전체 유동인구(또는 지역별 전체)를 적용")
+    return table, SKM, notes
 
 
 # ---------------------------------------------------------------------
@@ -666,6 +814,7 @@ def write_blocks(writer, sheet, blocks):
 # 8. 메인
 # ---------------------------------------------------------------------
 def main():
+    global MIN_PEERS
     print("=" * 66)
     print(" 사회적 고립 위험 가능성 1차 탐색 (신한카드 데이터)")
     print("=" * 66)
@@ -674,7 +823,7 @@ def main():
 
     # ① ~ ③ 파일 읽기
     print(f"\n[1] '{DATA_FOLDER}' 폴더에서 엑셀 파일 검색/읽기")
-    df, load_log, files, sk_raw = load_all_excels(DATA_FOLDER)
+    df, load_log, files, sk_raw, sk_total_raw = load_all_excels(DATA_FOLDER)
     print(f"    발견한 파일 {len(files)}개")
     if df is None or df.empty:
         sys.exit("\n[중단] 분석에 쓸 수 있는 데이터를 읽지 못했습니다. "
@@ -707,6 +856,22 @@ def main():
     S["total_use"] = total_use
     elig = S["eligible"]
     peers = S[PEER_COL]
+
+    # 연령대별 분석 단위 현황 (연령대 내 비교에 쓸 수 있는 표본 수)
+    per_age = S.groupby(PEER_COL).agg(분석단위수=("eligible", "size"), 표본충분=("eligible", "sum"))
+    print(f"\n    [연령대별 분석 단위 현황] (표본충분 >= MIN_PEERS({MIN_PEERS}) 이어야 판단 가능)")
+    print(per_age.to_string())
+    relax_note = None
+    if int(per_age["표본충분"].max()) < MIN_PEERS:
+        best = int(per_age["표본충분"].max())
+        if AUTO_RELAX_MIN_PEERS and best >= MIN_PEERS_FLOOR:
+            relax_note = (f"어떤 연령대도 MIN_PEERS({MIN_PEERS})를 채우지 못해 {best}로 자동 완화함 "
+                          "(표본이 적어 백분위 해석에 주의)")
+            print(f"    [주의] {relax_note}")
+            MIN_PEERS = best
+        else:
+            print(f"    [주의] 연령대당 표본이 너무 적습니다(최대 {best}개, 최소 필요 "
+                  f"{MIN_PEERS_FLOOR if AUTO_RELAX_MIN_PEERS else MIN_PEERS}개).")
     rcols = list(M.columns[-min(RECENT_MONTHS, n_m):])
 
     # ⑧ 활동량: 최근 구간 일평균 이용건수의 '연령대 내 백분위' (높을수록 활동적 = 안정)
@@ -730,7 +895,8 @@ def main():
     pat, pat_thr = pattern_metrics(df, keys, months)
     S["pat_change"], S["pat_run"], S["pat_ratio"] = pat["pat_change"], pat["pat_run"], pat["pat_ratio"]
     S["chg_score"], _ = peer_percentile(S["pat_change"], peers, elig)   # 차이가 클수록 높음(안정)
-    S["persist_score"] = S["pat_ratio"].where(elig)                    # 달랐던 달이 길수록 높음(안정)
+    S["persist_pct"], _ = peer_percentile(S["pat_ratio"], peers, elig)
+    S["persist_score"] = S["persist_pct"]  # 변화 지속 원점수를 연령대 내 백분위로 변환
     # 참고용(점수 미반영): 활동량(이용건수) 자체의 증감
     cm_raw = change_metrics(M)
     S["base_act"], S["change_pct"] = cm_raw["base"], cm_raw["change_pct"]
@@ -739,14 +905,27 @@ def main():
           "    [주의] 월 수 부족 또는 업종이 분석 단위에 포함되어 활동 변화를 계산하지 못했습니다.")
 
     # SK 유동인구: 점수에는 넣지 않고, 참고용 변화율만 계산해 함께 보여준다
-    sk_table, sk_notes = None, []
-    S["sk_change_pct"], S["sk_drop"] = np.nan, np.nan
+    #  - 성별·연령대별 SK 값이 있으면 그것을 우선 사용
+    #  - 없는 분석 단위는 성별·연령대 구분 없는 '전체 유동인구' 변화로 대체
+    sk_table, sk_total_table, sk_notes = None, None, []
+    S["sk_change_pct"], S["sk_drop"], S["sk_basis"] = np.nan, np.nan, "-"
     if sk_raw is not None:
         sk_table, SKM, sk_notes = build_sk(sk_raw, keys, months)
         if SKM is not None:
             cm_sk = change_metrics(SKM)
             S["sk_change_pct"], S["sk_drop"] = cm_sk["change_pct"], cm_sk["drop"]
-    else:
+            S.loc[S["sk_change_pct"].notna(), "sk_basis"] = "성별·연령대별"
+    if sk_total_raw is not None:
+        sk_total_table, SKMt, tot_notes = build_sk_total(sk_total_raw, keys, months)
+        sk_notes += tot_notes
+        if SKMt is not None:
+            cm_t = change_metrics(SKMt)
+            fill = S["sk_change_pct"].isna() & cm_t["change_pct"].notna()
+            S.loc[fill, "sk_change_pct"] = cm_t.loc[fill, "change_pct"]
+            S.loc[fill, "sk_drop"] = cm_t.loc[fill, "drop"]
+            S.loc[fill, "sk_basis"] = "전체(성별·연령대 구분 없음)"
+            print(f"    SK 전체 유동인구로 보완한 분석 단위: {int(fill.sum()):,}개")
+    if sk_raw is None and sk_total_raw is None:
         sk_notes.append("SK 유동인구 데이터 없음")
     for m in sk_notes:
         print("    " + m)
@@ -763,13 +942,41 @@ def main():
     S["main_driver"] = comp.fillna(np.inf).idxmin(axis=1).where(S["score"].notna(), "-")   # 가장 낮은 항목
     S["change_ok"] = S["pat_change"].notna()
 
-    # ⑫ 분류 (점수가 낮을수록 위험)
-    cuts = cutoffs(S["score"], CLASSIFY_MODE)
-    S["class"] = classify(S["score"], cuts)
+    # 안정지수를 계산할 수 있는 분석 단위가 하나도 없으면 원인을 알려주고 멈춘다
+    if S["score"].notna().sum() == 0:
+        per_age = S.groupby(PEER_COL).agg(분석단위수=("eligible", "size"), 표본충분=("eligible", "sum"))
+        print("\n[중단] 안정지수를 계산할 수 있는 분석 단위가 없습니다.")
+        print(f"  - 연령대 내 비교에는 연령대마다 표본이 충분한 분석 단위가 MIN_PEERS({MIN_PEERS})개 이상 필요합니다.")
+        print(f"  - 분석 단위 전체 이용건수가 MIN_SEGMENT_TOTAL({MIN_SEGMENT_TOTAL}) 미만이면 표본부족으로 제외됩니다.")
+        print("  - 연령대별 현황:")
+        print(per_age.to_string())
+        print("  -> 분석 단위(SEGMENT_COLS)를 줄이거나(예: 지역 제외), MIN_PEERS를 낮추거나, 데이터를 더 넣어 보세요.")
+        sys.exit(1)
+
+    # ⑫ 분류: 연령대별 안정지수 하위 25%/10%를 관심군/위험군으로 분류
+    S["class"] = "판단불가"
+    age_cuts = {}
+    for age, group_idx in S.groupby(PEER_COL).groups.items():
+        vals = S.loc[group_idx, "score"].dropna()
+        if len(vals) < MIN_PEERS:
+            S.loc[group_idx, "class"] = "판단불가(연령대 표본부족)"
+            continue
+        watch_cut = vals.quantile(PCT_CUTS[0])
+        risk_cut = vals.quantile(PCT_CUTS[1])
+        age_cuts[str(age)] = (watch_cut, risk_cut, len(vals))
+        score_values = S.loc[group_idx, "score"]
+        S.loc[group_idx, "class"] = np.where(
+            score_values.isna(), "판단불가",
+            np.where(score_values <= risk_cut, LABELS[2],
+                     np.where(score_values <= watch_cut, LABELS[1], LABELS[0]))
+        )
     sc = S["score"].dropna()
-    print(f"\n[7] 안정지수 분포: 평균 {sc.mean():.1f} / 중앙값 {sc.median():.1f} / 표준편차 {sc.std():.1f} "
-          f"/ 최소 {sc.min():.1f} / 최대 {sc.max():.1f}")
-    print(f"    분류 기준({CLASSIFY_MODE}): 관심군 {cuts[0]:.1f}점 이하, 위험군 {cuts[1]:.1f}점 이하")
+    if len(sc):
+        print(f"\n[7] 안정지수 분포: 평균 {sc.mean():.1f} / 중앙값 {sc.median():.1f} / 표준편차 {sc.std():.1f} "
+              f"/ 최소 {sc.min():.1f} / 최대 {sc.max():.1f}")
+    print(f"    분류 기준: 연령대별 하위 {int(PCT_CUTS[0]*100)}% 관심군 / 하위 {int(PCT_CUTS[1]*100)}% 위험군")
+    for age, (watch_cut, risk_cut, n_age) in age_cuts.items():
+        print(f"      {age}: 표본 {n_age}개, 관심군 <= {watch_cut:.1f}, 위험군 <= {risk_cut:.1f}")
 
     # 해설 문장
     def reason(r):
@@ -790,7 +997,8 @@ def main():
             way = "감소" if r["sk_change_pct"] < 0 else "증가"
             both = " -> 카드·유동인구 동시 감소" if (r["sk_change_pct"] < 0 and pd.notna(r["change_pct"])
                                                   and r["change_pct"] < 0) else ""
-            parts.append(f"유동인구(SK) {abs(r['sk_change_pct']):.0%} {way}{both}")
+            lab = "유동인구(SK)" if r["sk_basis"] == "성별·연령대별" else "유동인구(SK, 전체 기준)"
+            parts.append(f"{lab} {abs(r['sk_change_pct']):.0%} {way}{both}")
         parts.append(f"가장 낮은 항목: {r['main_driver']}")
         return " | ".join(parts)
 
@@ -803,6 +1011,8 @@ def main():
         t["is_risk"] = (t["class"] == LABELS[2]).astype(float)
         t["is_watch"] = (t["class"] == LABELS[1]).astype(float)
         t["w"] = t["recent_act"].clip(lower=0)
+        # 활동량 가중평균 계산용 열: apply()의 pandas 버전별 반환 형태 차이를 피한다.
+        t["weighted_score"] = t["score"] * t["w"]
         g = t.groupby(by)
         out = g.agg(분석단위수=("score", "size"), 평균_안정지수=("score", "mean"),
                     중앙값=("score", "median"), 표준편차=("score", "std"),
@@ -811,8 +1021,9 @@ def main():
                     변화_점수=("pts_활동 변화", "mean"), 지속_점수=("pts_변화 지속", "mean"),
                     평균_활동변화율=("change_pct", "mean"),
                     평균_유동인구변화율=("sk_change_pct", "mean"))
-        out["활동량가중_평균_안정지수"] = g.apply(
-            lambda x: np.average(x["score"], weights=x["w"]) if x["w"].sum() > 0 else np.nan)
+        weighted_sum = g["weighted_score"].sum()
+        weight_sum = g["w"].sum()
+        out["활동량가중_평균_안정지수"] = weighted_sum.div(weight_sum.where(weight_sum > 0))
         out["관심군_이상_비율"] = out["위험군_비율"] + out["관심군_비율"]
         out["위험군_비율"] *= 100
         out["관심군_비율"] *= 100
@@ -831,18 +1042,19 @@ def main():
     print(show.round(1).to_string(index=False))
 
     # ⑭ 엑셀 저장
-    print(f"\n[9] 결과 저장: {OUTPUT_FILE}")
+    out_path = resolve_output_path(OUTPUT_FILE)
+    print(f"\n[9] 결과 저장: {out_path}")
     S_sorted = S.sort_values(["age_order", "score"], ascending=[True, True])   # 점수 낮은(위험한) 순
     seg_cols = SEG
     mlabels = [str(m) for m in months]
 
     t_all = S_sorted[seg_cols + ["score", "class", "pts_활동량", "pts_활동 다양성", "pts_활동 변화",
-                                 "pts_변화 지속", "sk_change_pct", "main_driver", "reason"]].copy()
+                                 "pts_변화 지속", "sk_change_pct", "sk_basis", "main_driver", "reason"]].copy()
     t_all["sk_change_pct"] *= 100
     t_all.columns = seg_cols + ["안정지수", "분류", "활동량 점수", "다양성 점수", "활동 변화 점수",
-                                "변화 지속 점수", "유동인구 변화율(%)", "가장 낮은 항목", "해석"]
+                                "변화 지속 점수", "유동인구 변화율(%)", "유동인구 기준", "가장 낮은 항목", "해석"]
     if t_all["유동인구 변화율(%)"].isna().all():
-        t_all = t_all.drop(columns=["유동인구 변화율(%)"])
+        t_all = t_all.drop(columns=["유동인구 변화율(%)", "유동인구 기준"])
     t_all = t_all.sort_values(["안정지수"], ascending=True, na_position="last")
 
     t_act = S_sorted[seg_cols + ["total_use", "recent_cnt", "recent_amt", "recent_act", "act_pct",
@@ -862,7 +1074,7 @@ def main():
     dcols = [c for c in pat.columns if c.startswith("dist_")]
     t_chg = S_sorted[seg_cols + ["pat_change", "chg_score", "pat_run", "persist_score"]].copy()
     t_chg.columns = seg_cols + ["업종 분포 차이(1-코사인, 최근 vs 과거)", "활동 변화 점수(연령대 내 백분위,0~1)",
-                                "분포가 달랐던 연속 개월", "변화 지속 점수(0~1)"]
+                                "분포가 달랐던 연속 개월", "변화 지속 점수(연령대 내 백분위, 0~1)"]
     dm = pat.loc[S_sorted.index, dcols].copy()
     dm.columns = [f"월 분포 차이_{c[5:]}" for c in dcols]
     ref = S_sorted[["base_act", "recent_act", "change_pct", "persist_months"]].copy()
@@ -884,13 +1096,13 @@ def main():
     desc = S.loc[S["score"].notna(), ["score", "act_score", "div_score", "chg_score", "persist_score",
                                       "pat_change", "change_pct"]].copy()
     desc.columns = ["안정지수", "활동량 점수(0~1)", "다양성 점수(0~1)", "활동 변화 점수(0~1)",
-                    "변화 지속 점수(0~1)", "업종 분포 차이", "(참고)활동량 변화율"]
+                    "변화 지속 점수(연령대 내 백분위, 0~1)", "업종 분포 차이", "(참고)활동량 변화율"]
     dist = desc.describe(percentiles=[.1, .25, .5, .75, .9]).T.reset_index().rename(columns={"index": "지표"})
     by_age = S[S["score"].notna()].groupby(PEER_COL)["score"].describe(percentiles=[.1, .25, .5, .75]).reset_index()
     by_age = by_age.sort_values(PEER_COL, key=age_sort_key)
 
     cand = []
-    for name, mode in [("현재 설정(" + CLASSIFY_MODE + ")", CLASSIFY_MODE),
+    for name, mode in [("전체 분포 참고용(" + CLASSIFY_MODE + ")", CLASSIFY_MODE),
                        (f"고정({FIXED_CUTS[0]}/{FIXED_CUTS[1]})", "fixed"),
                        (f"평균-{Z_CUTS[0]}σ / -{Z_CUTS[1]}σ", "zscore"),
                        (f"하위 {int(PCT_CUTS[0]*100)}% / {int(PCT_CUTS[1]*100)}%", "percentile")]:
@@ -904,25 +1116,29 @@ def main():
     cand = pd.DataFrame(cand)
 
     setting = pd.DataFrame({"항목": [
-        "분석 단위", "활동량 기준 컬럼", "최근 구간(개월)", "과거 구간(개월)", "연령대 내 비교 최소 단위 수",
+        "분석 단위", "활동량 기준 컬럼", "최근 구간(개월)", "과거 구간(개월)", "연령대 내 비교 최소 단위 수(미달 시 판단불가)",
         "활동 변화 방식", "'달랐던 달' 기준(업종 분포 거리)", "(미사용)", "안정지수 계산", "분류 방식",
         "분석한 월", "분석 단위 수(전체/판단 가능)", "SK 유동인구(참고용, 점수 미반영)"],
         "값": [" x ".join(SEG), ACT, RECENT_MONTHS, BASELINE_MONTHS or "이전 전체", MIN_PEERS,
                "최근 vs 과거 업종 분포 차이(1-코사인 유사도)",
                ("-" if pd.isna(pat_thr) else f"{pat_thr:.4f} ({PATTERN_DIFF_THRESHOLD}, P{int(PATTERN_DIFF_QUANTILE*100)})"), "-",
                "활동량·다양성·활동 변화·변화 지속 4개 항목(각 0~100점) 단순 평균, 높을수록 안정",
-               f"{CLASSIFY_MODE}: 관심군 {cuts[0]:.1f}점 이하, 위험군 {cuts[1]:.1f}점 이하",
+               f"연령대별 백분위: 하위 {int(PCT_CUTS[0]*100)}% 관심군 / 하위 {int(PCT_CUTS[1]*100)}% 위험군; 표본 부족 시 판단불가",
                f"{months[0]} ~ {months[-1]} ({n_m}개월)", f"{len(S)} / {int(S['score'].notna().sum())}",
-               ("사용 - " + "; ".join(sk_notes)) if sk_table is not None else "사용 안 함"]})
+               ("사용 - " + "; ".join(sk_notes)) if (sk_table is not None or sk_total_table is not None) else "사용 안 함"]})
     caveat = pd.DataFrame({"해석 시 유의사항": [
         "이 결과는 사회적 고립을 진단하는 것이 아니라, 위험 가능성이 높은 집단을 1차로 탐색하는 용도입니다.",
         "데이터에 개인 ID가 없어 개인이 아닌 '분석 단위(집계 집단)'의 값입니다.",
         "MCT_SGG_CD는 '가맹점 지역'이므로 거주지가 아니라 소비가 일어난 지역입니다. (파일 로그에서 거주지로 대체된 파일이 있는지 확인)",
         "시간대(TIME_GB)는 사용하지 않았고, 기준일자는 TA_YMD를 사용했습니다.",
-        "안정지수는 높을수록 활동적·안정, 낮을수록 위험 가능성이 큽니다. 분류 기준은 확정값이 아니며 분포를 확인한 뒤 조정해야 합니다.",
+        "안정지수는 높을수록 활동적·안정, 낮을수록 위험 가능성이 큽니다. 연령대별 하위 25%는 관심군, 하위 10%는 위험군으로 분류합니다. 연령대 표본이 부족하면 전체 기준으로 대체하지 않고 판단불가 처리합니다.",
         "분석 단위의 규모(인구)를 알 수 없어 활동량 '수준'은 규모 영향을 받습니다. 그래서 자기 자신의 과거 대비 '변화'를 함께 봅니다."]})
 
-    for d_ in [t_all] + ([sk_table] if sk_table is not None else []) + [t_act, t_div, t_chg, t_cls, age_tbl, desc, dist, by_age, cand]:
+    if relax_note:
+        caveat.loc[len(caveat)] = ["※ " + relax_note]
+
+    for d_ in [t_all] + ([sk_table] if sk_table is not None else []) + \
+              ([sk_total_table] if sk_total_table is not None else []) + [t_act, t_div, t_chg, t_cls, age_tbl, desc, dist, by_age, cand]:
         for c in d_.select_dtypes(include="number").columns:
             d_[c] = d_[c].round(3)
     if sex_tbl is not None:
@@ -933,14 +1149,14 @@ def main():
             d_[c] = d_[c].round(2)
 
     block_sheets = {"위험군_분류", "설정_분포"}
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as w:
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
         t_all.to_excel(w, sheet_name="전체_안정지수", index=False)
         age_tbl.to_excel(w, sheet_name="연령대별_분석", index=False)
         t_act.to_excel(w, sheet_name="활동량", index=False)
         t_div.to_excel(w, sheet_name="활동_다양성", index=False)
         t_chg.to_excel(w, sheet_name="활동_변화", index=False)
         write_blocks(w, "위험군_분류", [
-            (f"연령대별 분류 건수 (기준: 관심군 {cuts[0]:.1f}점 이하, 위험군 {cuts[1]:.1f}점 이하)", ct),
+            (f"연령대별 분류 건수 (각 연령대 하위 {int(PCT_CUTS[0]*100)}% 관심군 / {int(PCT_CUTS[1]*100)}% 위험군)", ct),
             ("관심군/위험군 분석 단위 목록", t_cls)])
         if sex_tbl is not None:
             sex_tbl.to_excel(w, sheet_name="연령대_성별", index=False)
@@ -950,9 +1166,11 @@ def main():
             ("분류 기준 후보 비교", cand)])
         if sk_table is not None:
             sk_table.to_excel(w, sheet_name="유동인구_변화", index=False)
+        if sk_total_table is not None:
+            sk_total_table.to_excel(w, sheet_name="유동인구_전체", index=False)
         quality.to_excel(w, sheet_name="데이터_점검", index=False)
         pd.DataFrame(load_log).to_excel(w, sheet_name="파일_로그", index=False)
-    style_workbook(OUTPUT_FILE, block_sheets)
+    style_workbook(out_path, block_sheets)
     print("    완료. 시트: 전체_안정지수, 연령대별_분석, 활동량, 활동_다양성, 활동_변화, 위험군_분류, "
           "연령대_성별, 설정_분포, 데이터_점검, 파일_로그")
 
